@@ -143,6 +143,13 @@ Shapes combine: `--depth 1` normally reports `shallow single-branch`.
   its refs moved and then fail on the reset.
 - **Directories that are not repositories** — reported as `skipped` so that a
   repository which loses its `.git` cannot silently drop out of the sweep.
+- **Anything inside a repository.** Discovery stops at each repository rather
+  than descending through its working tree. A clone sitting inside another
+  repo's checkout is that repo's content, not a mirror of its own — and it
+  means a project whose test suite ships `.git` fixtures (git itself, among
+  others) cannot produce dozens of bogus repositories. It is also what makes
+  the scan fast: descending meant visiting ~190,000 directories to find
+  nothing.
 
 ## Exporting a manifest
 
@@ -153,6 +160,14 @@ strictly read-only.
 ./export.sh > mirrors.tsv
 ./export.sh security          # just one subtree
 ```
+
+**Exactly one ROOT may be given.** `./export.sh */` is an error, not a silent
+export of whichever directory the glob happened to list last — pass their
+common parent instead. `pull.sh` behaves the same way.
+
+Both scripts print progress to **stderr when it is a terminal**, so you can see
+that they are alive; when output is redirected or piped, stderr stays empty and
+the manifest is the only thing produced.
 
 ```
 # path	url	shape	branch	depth	filter

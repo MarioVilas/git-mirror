@@ -23,55 +23,42 @@ is_repo_root() {
 }
 
 # discover_repos ROOT -- repository directories below ROOT, one per line.
-#
-# Pruning at .git keeps find out of repository internals, which on a repo the
-# size of linux dominates the walk. ROOT itself is excluded even when it is a
-# repository: it may well be the workspace holding these scripts, and treating
-# it as a mirror would reset away real work.
-#
-# Worktree repos are found by their .git directory. Bare repos have none, so
-# they are found by their HEAD file and then verified -- a repository's own
-# contents can include a file called HEAD (git's test suite does), and only the
-# identity check tells the two apart.
 discover_repos() {
-  local root=$1
-  local worktrees=() prune=() candidates=() r
+  local root=$1 line kind path
 
-  mapfile -t worktrees < <(
-    find "$root" -type d -name .git -prune -printf '%h\n' 2>/dev/null | LC_ALL=C sort -u
-  )
-
-  # Finding bare repos means examining files rather than just directories --
-  # ruinous across a worktree the size of firefox. So prune the repositories
-  # already found: nearly every file in the tree lives inside one, and none of
-  # them can contain a bare repo we care about.
-  for r in "${worktrees[@]}"; do
-    [ -n "$r" ] || continue
-    prune+=(-path "$r" -o)
-  done
-
-  if [ ${#prune[@]} -gt 0 ]; then
-    unset 'prune[-1]'   # drop the trailing -o
-    mapfile -t candidates < <(
-      find "$root" \( "${prune[@]}" \) -prune -o -type f -name HEAD -printf '%h\n' 2>/dev/null | LC_ALL=C sort -u
-    )
-  else
-    mapfile -t candidates < <(
-      find "$root" -type f -name HEAD -printf '%h\n' 2>/dev/null | LC_ALL=C sort -u
-    )
-  fi
-
-  {
-    # Guarded: printf on an empty array still emits one blank line, which would
-    # become a repository whose path is "" -- and `git -C ""` silently means
-    # the current directory, so such a phantom would operate on whatever
-    # repository the user happens to be standing in.
-    [ ${#worktrees[@]} -gt 0 ] && printf '%s\n' "${worktrees[@]}"
-    for r in "${candidates[@]}"; do
-      [ -n "$r" ] || continue
-      is_repo_root "$r" && echo "$r"
-    done
-  } | grep -vxF -- "$root" | LC_ALL=C sort -u
+  # A single walk that stops at every repository it finds. Descending into a
+  # working tree is pure waste -- on a library of this size it meant visiting
+  # ~190,000 directories to find nothing, 23x slower than stopping at the repo.
+  # It is also wrong: a clone inside another repository's working tree is that
+  # repository's content, not a mirror, and a project whose test suite contains
+  # .git fixtures (git itself, among others) would otherwise yield dozens of
+  # bogus repositories.
+  #
+  #   branch 1  skip .git directories. A repository's own .git holds HEAD and
+  #             objects/, so branch 3 would take it for a bare repo -- and
+  #             is_repo_root would agree, since structurally it is one.
+  #   branch 2  a directory containing .git is a worktree repository (W)
+  #   branch 3  a directory containing HEAD and objects/ may be bare (B),
+  #             confirmed below, since a repository's files can look like this
+  #
+  # -mindepth 1 keeps ROOT itself out of the results: it may be the workspace
+  # holding these scripts, and treating it as a mirror would reset real work.
+  find "$root" -mindepth 1 \
+    \( -type d -name .git -prune \) -o \
+    \( -type d -exec test -e '{}/.git' \; -printf 'W %p\n' -prune \) -o \
+    \( -type d -exec test -e '{}/HEAD' \; -exec test -d '{}/objects' \; -printf 'B %p\n' -prune \) \
+    2>/dev/null |
+  while IFS= read -r line; do
+    # Fixed-width marker, not field splitting: a path may begin with a space.
+    [ -n "$line" ] || continue
+    kind=${line:0:1}
+    path=${line:2}
+    [ -n "$path" ] || continue
+    case $kind in
+      W) echo "$path" ;;
+      B) is_repo_root "$path" && echo "$path" ;;
+    esac
+  done | LC_ALL=C sort -u
 }
 
 # The shape of a clone: how its owner chose to create it. Reported by pull.sh

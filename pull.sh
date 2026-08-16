@@ -373,6 +373,11 @@ main() {
   local nonrepos=()
   mapfile -t nonrepos < <(discover_skipped "${repos[@]}")
 
+  # Output is held back until every job finishes, so that parallel runs cannot
+  # interleave. On a large library that is a long silence; say what is starting.
+  # Terminal only, so redirected output stays clean.
+  [ -t 2 ] && printf 'pull.sh: updating %d repositories, %d at a time\n' "$total" "$JOBS" >&2
+
   OUTDIR=$(mktemp -d) || return 1
   trap 'rm -rf "${OUTDIR:-}"' EXIT
 

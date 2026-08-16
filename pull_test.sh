@@ -911,4 +911,23 @@ if test_case "rejects_more_than_one_root_argument"; then
   end_case
 fi
 
+# ---------------------------------------------------------------------------
+# Discovery prunes at each repository: a clone sitting inside another repo's
+# working tree is that repo's content, not a mirror of its own. This also keeps
+# projects whose test suites contain .git fixtures (git itself, among others)
+# from producing dozens of bogus "repositories".
+if test_case "does_not_look_for_repositories_inside_a_repository"; then
+  new_upstream alpha
+  new_upstream nested
+  clone_repo tools alpha
+  git clone -q "$WORK/up/nested.git" "$(repo tools alpha)/vendored"
+
+  run_pull "$WORK/lib"
+
+  assert_contains "$(pull_report)" "1 repos" "only the outer repository is a mirror"
+  assert_not_contains "$(pull_lines would)" "vendored" "nested clone not listed"
+  assert_not_contains "$(pull_lines ok)" "vendored" "nested clone not updated"
+  end_case
+fi
+
 finish_tests
