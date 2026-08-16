@@ -51,7 +51,9 @@ convention. The layout this was built for looks like:
 
 ```
 ref/
-├── pull.sh
+├── pull.sh          # update every mirror
+├── export.sh        # write a manifest of what is here
+├── common.sh        # discovery and shape detection, shared by both
 ├── security/
 │   ├── testssl.sh/
 │   └── wpscan/
@@ -142,6 +144,58 @@ Shapes combine: `--depth 1` normally reports `shallow single-branch`.
 - **Directories that are not repositories** — reported as `skipped` so that a
   repository which loses its `.git` cannot silently drop out of the sweep.
 
+## Exporting a manifest
+
+`export.sh` writes a tab-separated inventory of the library to stdout. It is
+strictly read-only.
+
+```sh
+./export.sh > mirrors.tsv
+./export.sh security          # just one subtree
+```
+
+```
+# path	url	shape	branch	depth	filter
+security/testssl.sh	https://github.com/testssl/testssl.sh	full
+operating_systems/linux	https://github.com/torvalds/linux	shallow single-branch	master	1
+archive/netscape.git	https://example.org/netscape.git	bare
+```
+
+The manifest records **shape as well as origin**, because recreating a
+deliberately shallow mirror as a full clone would silently change what the
+library contains. `branch` is filled in for single-branch clones, `depth` for
+shallow ones, `filter` for partial ones.
+
+Rows are sorted by path and there is **no timestamp**, so re-exporting an
+unchanged library produces a byte-identical file — the manifest can be
+committed and its diffs mean something.
+
+A repository that cannot be represented — no `origin`, or a path containing a
+tab or newline — is reported on stderr, left out, and makes the exit status
+non-zero, so a partial manifest is never mistaken for a complete one.
+
+### Why TSV
+
+Because it needs no escaping. `IFS=$'\t' read -r path url shape` is a complete
+and *correct* parser, whereas naive CSV parsing in shell silently corrupts any
+field containing a comma — truncating the URL and shifting every column after
+it. JSON and YAML are worse still: neither can be parsed in Bash without a
+dependency such as `jq`.
+
+The trade is that a field cannot contain a tab or newline. That is why export
+refuses such a repository rather than writing a corrupt row.
+
+Nothing is lost in convertibility — spreadsheets import TSV directly, and
+standard tools handle the rest:
+
+```sh
+# TSV -> CSV (quoting only the fields that need it)
+awk -F'\t' 'BEGIN{OFS=","} {for(i=1;i<=NF;i++) if($i ~ /[",]/) {gsub(/"/,"\"\"",$i); $i="\"" $i "\""} print}' mirrors.tsv
+
+# TSV -> JSON
+awk -F'\t' 'BEGIN{print "["} !/^#/{printf "%s  {\"path\":\"%s\",\"url\":\"%s\",\"shape\":\"%s\"}", (n++?",\n":""), $1,$2,$3} END{print "\n]"}' mirrors.tsv
+```
+
 ## Assumptions
 
 1. The remote is called **`origin`**. A repository cloned with `-o something`
@@ -154,6 +208,9 @@ Shapes combine: `--depth 1` normally reports `shallow single-branch`.
    distinguish your own projects from mirrors** — see the next section.
 5. GNU `find` (uses `-printf`), `git` ≥ 2.29 (negative refspecs), Bash ≥ 4.3
    (`wait -n`). Developed on Linux with git 2.43 and Bash 5.2.
+6. **The scripts are not standalone.** `pull.sh` and `export.sh` both source
+   `common.sh` from their own directory; keep the files together. Each exits
+   with a clear error if it cannot find it.
 
 ## Limitations
 
@@ -161,8 +218,9 @@ Shapes combine: `--depth 1` normally reports `shallow single-branch`.
   mirrored, but its submodule *contents* are not: you get the gitlink, not the
   code. Nothing is corrupted, the archive is just incomplete for that project.
 - **Shallow and partial clones are, by design, incomplete.** See below.
-- There is no clone/bootstrap command yet; you create the repositories
-  yourself with `git clone`.
+- There is no import command yet: `export.sh` records what you have, but
+  recreating a library elsewhere from a manifest is still manual. You create
+  the repositories yourself with `git clone`.
 
 ## Welp, I shot myself in the foot
 
@@ -239,14 +297,21 @@ inside a mirror; keep them somewhere the script does not manage.
 ## Tests
 
 ```sh
-./pull_test.sh              # the whole suite
-FILTER=shallow ./pull_test.sh   # only tests whose name contains "shallow"
+./pull_test.sh                   # pull.sh
+./export_test.sh                 # export.sh
+FILTER=shallow ./pull_test.sh    # only tests whose name contains "shallow"
 ```
 
-The suite builds throwaway fixtures — bare "upstream" repositories plus clones
-of every supported shape — under `$TMPDIR`. It never touches a real
-repository. Every behaviour documented above has a test, including the
-destructive ones.
+Both suites build throwaway fixtures — bare "upstream" repositories plus clones
+of every supported shape — under `$TMPDIR`, sharing `test_common.sh`. They
+never touch a real repository. Every behaviour documented above has a test,
+including the destructive ones.
+
+One test is worth knowing about: `never_operates_on_the_current_directory`. An
+early version emitted an empty path for a library containing no worktree repos,
+and `git -C ""` silently means *the current directory* — so `pull.sh` hard-reset
+whatever repository you happened to be standing in. That test exists so it
+cannot come back.
 
 ## License
 

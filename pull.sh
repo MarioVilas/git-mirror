@@ -20,6 +20,17 @@
 #
 set -uo pipefail
 
+# Repository discovery and shape classification, shared with the other tools
+# here. Sourced rather than duplicated: it is the subtlest code in the project,
+# so this script is not standalone -- common.sh must sit beside it.
+COMMON="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/common.sh"
+if [ ! -r "$COMMON" ]; then
+  echo "pull.sh: cannot read common.sh -- expected it beside this script at $COMMON" >&2
+  exit 2
+fi
+# shellcheck source=common.sh
+source "$COMMON"
+
 JOBS=4
 DRY_RUN=0
 QUIET=0
@@ -68,7 +79,13 @@ parse_args() {
       -h|--help) usage; exit 0 ;;
       --) shift; break ;;
       -*) echo "pull.sh: unknown option: $1" >&2; usage >&2; exit 2 ;;
-      *) ROOT=$1; shift ;;
+      *)
+        if [ -n "$ROOT" ]; then
+          echo "pull.sh: only one ROOT may be given (got '$ROOT' and '$1')" >&2
+          echo "pull.sh: to cover several directories, pass their common parent" >&2
+          exit 2
+        fi
+        ROOT=$1; shift ;;
     esac
   done
 
@@ -87,71 +104,6 @@ parse_args() {
   # trailing slash (or a relative one) would no longer match them -- and the
   # root repository would stop being excluded from the sweep.
   ROOT=$(cd "$ROOT" && pwd) || exit 2
-}
-
-# Is this directory itself a repository root? `git rev-parse` walks upwards, so
-# asking it naively from any subdirectory of a repo answers yes. Identity is
-# the reliable test: for a bare repo the git dir IS the directory; for a
-# worktree the toplevel is. The latter also covers --separate-git-dir, whose
-# git dir lives elsewhere entirely.
-is_repo_root() {
-  local dir=$1 abs
-  abs=$(cd "$dir" 2>/dev/null && pwd) || return 1
-  if [ "$(git -C "$dir" rev-parse --is-bare-repository 2>/dev/null)" = true ]; then
-    [ "$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)" = "$abs" ]
-  else
-    [ "$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" = "$abs" ]
-  fi
-}
-
-# Repository directories below ROOT. Pruning at .git keeps find out of
-# repository internals, which on a repo the size of linux dominates the walk.
-# ROOT itself is excluded even when it is a repository: it may well be the
-# workspace holding this script, and a mirror update would reset away real
-# work. Only repositories *below* ROOT are mirrors.
-#
-# Worktree repos are found by their .git directory. Bare repos have none, so
-# they are found by their HEAD file and then verified -- a repository's own
-# contents can include a file called HEAD (git's test suite does), and only the
-# identity check tells the two apart.
-discover_repos() {
-  local worktrees=() prune=() candidates=() r
-
-  mapfile -t worktrees < <(
-    find "$ROOT" -type d -name .git -prune -printf '%h\n' 2>/dev/null | sort -u
-  )
-
-  # Finding bare repos means examining files rather than just directories --
-  # ruinous across a worktree the size of firefox. So prune the repositories
-  # already found: nearly every file in the tree lives inside one, and none of
-  # them can contain a bare repo we care about.
-  for r in "${worktrees[@]}"; do
-    [ -n "$r" ] || continue
-    prune+=(-path "$r" -o)
-  done
-
-  if [ ${#prune[@]} -gt 0 ]; then
-    unset 'prune[-1]'   # drop the trailing -o
-    mapfile -t candidates < <(
-      find "$ROOT" \( "${prune[@]}" \) -prune -o -type f -name HEAD -printf '%h\n' 2>/dev/null | sort -u
-    )
-  else
-    mapfile -t candidates < <(
-      find "$ROOT" -type f -name HEAD -printf '%h\n' 2>/dev/null | sort -u
-    )
-  fi
-
-  {
-    # Guarded: printf on an empty array still emits one blank line, which would
-    # become a repository whose path is "" -- and `git -C ""` silently means
-    # the current directory, so such a phantom would operate on whatever
-    # repository the user happens to be standing in.
-    [ ${#worktrees[@]} -gt 0 ] && printf '%s\n' "${worktrees[@]}"
-    for r in "${candidates[@]}"; do
-      [ -n "$r" ] || continue
-      is_repo_root "$r" && echo "$r"
-    done
-  } | grep -vxF -- "$ROOT" | sort -u
 }
 
 # Reasons to leave a repository untouched this run. Checked before any fetch,
@@ -209,36 +161,6 @@ discover_skipped() {
       echo "$child"
     done
   done | sort
-}
-
-# The shape of a clone: how its owner chose to create it. Reported on every
-# run and preserved, never "corrected" -- a shallow or single-branch mirror is
-# a legitimate choice. Content drift (local commits, dirty trees, stray
-# branches) is a separate matter and is always discarded.
-repo_shape() {
-  local repo=$1 attrs=()
-
-  if [ "$(git -C "$repo" rev-parse --is-bare-repository 2>/dev/null)" = true ]; then
-    echo bare
-    return
-  fi
-
-  [ "$(git -C "$repo" rev-parse --is-shallow-repository 2>/dev/null)" = true ] && attrs+=(shallow)
-  [ -n "$(git -C "$repo" config --get remote.origin.promisor 2>/dev/null)" ] && attrs+=(partial)
-
-  local fetchspec
-  fetchspec=$(git -C "$repo" config --get-all remote.origin.fetch 2>/dev/null)
-  case "$fetchspec" in
-    '')               attrs+=(no-remote) ;;
-    *'refs/heads/*'*) ;;
-    *)                attrs+=(single-branch) ;;
-  esac
-
-  if [ ${#attrs[@]} -eq 0 ]; then
-    echo full
-  else
-    echo "${attrs[*]}"
-  fi
 }
 
 # The refspecs that mirror local branches, derived from what this clone is
@@ -437,7 +359,7 @@ main() {
   parse_args "$@"
 
   local repos=() discovered=() r
-  mapfile -t discovered < <(discover_repos)
+  mapfile -t discovered < <(discover_repos "$ROOT")
   for r in "${discovered[@]}"; do
     [ -n "$r" ] && repos+=("$r")
   done

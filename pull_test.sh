@@ -1,132 +1,23 @@
 #!/usr/bin/env bash
 # Test suite for pull.sh
 #
-# Each test builds a throwaway fixture: bare "upstream" repos plus clones
-# arranged as <root>/<category>/<repo>, mirroring the real library layout.
-# Run:  bash pull_test.sh  [test_name_substring]
+# Fixtures, assertions and the runner live in test_common.sh.
+# Run:  ./pull_test.sh  [FILTER=substring]
 
 set -uo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SUITE=pull
+# shellcheck source=test_common.sh
+source "$SCRIPT_DIR/test_common.sh"
+
 PULL="$SCRIPT_DIR/pull.sh"
-TESTROOT="${TMPDIR:-/tmp}/pull-sh-tests.$$"
-
-# Isolate from the user's git config so tests are deterministic.
-export GIT_CONFIG_NOSYSTEM=1
-export GIT_CONFIG_GLOBAL=/dev/null
-export GIT_TERMINAL_PROMPT=0
-export GIT_AUTHOR_NAME=test GIT_AUTHOR_EMAIL=test@example.com
-export GIT_COMMITTER_NAME=test GIT_COMMITTER_EMAIL=test@example.com
-
-PASS=0
-FAIL=0
-FAILED_NAMES=()
-CURRENT_TEST=""
-WORK=""
-
-# ---------------------------------------------------------------- fixtures
-
-# new_upstream NAME -- bare origin with one commit on 'main', plus an
-# "author" work clone used to push further changes to it.
-new_upstream() {
-  local name=$1
-  git init -q --bare -b main "$WORK/up/$name.git"
-  git clone -q "$WORK/up/$name.git" "$WORK/authors/$name" 2>/dev/null
-  git -C "$WORK/authors/$name" checkout -q -b main 2>/dev/null
-  echo "initial" >"$WORK/authors/$name/README"
-  git -C "$WORK/authors/$name" add -A
-  git -C "$WORK/authors/$name" commit -qm "initial"
-  git -C "$WORK/authors/$name" push -q origin main
-}
-
-# upstream_commit NAME [BRANCH] [FILE] -- add a commit upstream
-upstream_commit() {
-  local name=$1 branch=${2:-main} file=${3:-README}
-  local a="$WORK/authors/$name"
-  git -C "$a" checkout -q "$branch" 2>/dev/null || git -C "$a" checkout -q -b "$branch"
-  echo "change-$RANDOM" >>"$a/$file"
-  git -C "$a" add -A
-  git -C "$a" commit -qm "update $file on $branch"
-  git -C "$a" push -q origin "$branch"
-}
-
-# upstream_add_file NAME FILE CONTENT -- commit a brand new file on main
-upstream_add_file() {
-  local name=$1 file=$2 content=$3
-  local a="$WORK/authors/$name"
-  git -C "$a" checkout -q main
-  printf '%s\n' "$content" >"$a/$file"
-  git -C "$a" add -A
-  git -C "$a" commit -qm "add $file"
-  git -C "$a" push -q origin main
-}
-
-upstream_tag() {
-  local name=$1 tag=$2
-  git -C "$WORK/authors/$name" tag "$tag"
-  git -C "$WORK/authors/$name" push -q origin "$tag"
-}
-
-upstream_delete_branch() {
-  local name=$1 branch=$2
-  git -C "$WORK/authors/$name" push -q origin --delete "$branch"
-}
-
-upstream_delete_tag() {
-  local name=$1 tag=$2
-  git -C "$WORK/authors/$name" push -q origin --delete "refs/tags/$tag"
-}
-
-# clone_repo CATEGORY NAME -- clone upstream into the library layout
-clone_repo() {
-  local cat=$1 name=$2
-  mkdir -p "$WORK/lib/$cat"
-  git clone -q "$WORK/up/$name.git" "$WORK/lib/$cat/$name"
-}
-
-# A file:// URL -- required for --depth, which is ignored for local path clones.
-up_url() { echo "file://$WORK/up/$1.git"; }
-
-# Alternative clone shapes the script must detect and preserve.
-clone_repo_shallow() {
-  local cat=$1 name=$2
-  mkdir -p "$WORK/lib/$cat"
-  git clone -q --depth 1 "$(up_url "$name")" "$WORK/lib/$cat/$name"
-}
-
-clone_repo_single_branch() {
-  local cat=$1 name=$2
-  mkdir -p "$WORK/lib/$cat"
-  git clone -q --single-branch "$(up_url "$name")" "$WORK/lib/$cat/$name"
-}
-
-clone_repo_partial() {
-  local cat=$1 name=$2
-  mkdir -p "$WORK/lib/$cat"
-  git -C "$WORK/up/$name.git" config uploadpack.allowFilter true
-  git clone -q --filter=blob:none "$(up_url "$name")" "$WORK/lib/$cat/$name"
-}
-
-clone_repo_bare() {
-  local cat=$1 name=$2 dir=${3:-$2.git}
-  mkdir -p "$WORK/lib/$cat"
-  git clone -q --bare "$(up_url "$name")" "$WORK/lib/$cat/$dir"
-}
-
-clone_repo_mirror() {
-  local cat=$1 name=$2 dir=${3:-$2.git}
-  mkdir -p "$WORK/lib/$cat"
-  git clone -q --mirror "$(up_url "$name")" "$WORK/lib/$cat/$dir"
-}
-
-repo() { echo "$WORK/lib/$1/$2"; }
 
 run_pull() { "$PULL" "$@" >"$WORK/stdout" 2>"$WORK/stderr"; echo $? >"$WORK/exit"; }
 pull_exit() { cat "$WORK/exit"; }
-pull_out() { cat "$WORK/stdout" "$WORK/stderr"; }
 
 # pull.sh's own structured report, free of git chatter and absolute paths --
-# assert on this, never on pull_out, or fixture paths leak into the haystack.
+# assert on this, never on pull_report and friends, or fixture paths leak into the haystack.
 pull_report() { cat "$WORK/stdout"; }
 pull_anomalies() { grep '^!' "$WORK/stdout" || true; }
 
@@ -137,66 +28,6 @@ pull_lines() { grep "^$1" "$WORK/stdout" || true; }
 # The bracketed shape fields only. A clone can have several attributes at once
 # (--depth implies --single-branch), so match words, not the whole field.
 pull_shapes() { grep -o '\[[^]]*\]' "$WORK/stdout" | tr -d '[]' || true; }
-
-# ---------------------------------------------------------------- assertions
-
-fail_test() {
-  echo "    FAIL: $1"
-  [ -n "${2:-}" ] && echo "      $2"
-  FAIL_CURRENT=1
-}
-
-assert_eq() {
-  local expected=$1 actual=$2 what=${3:-value}
-  [ "$expected" = "$actual" ] && return 0
-  fail_test "$what" "expected: [$expected]  actual: [$actual]"
-}
-
-assert_contains() {
-  local haystack=$1 needle=$2 what=${3:-output}
-  case "$haystack" in *"$needle"*) return 0;; esac
-  fail_test "$what does not contain [$needle]" "got: $haystack"
-}
-
-assert_not_contains() {
-  local haystack=$1 needle=$2 what=${3:-output}
-  case "$haystack" in *"$needle"*) fail_test "$what unexpectedly contains [$needle]"; return;; esac
-  return 0
-}
-
-assert_file_content() {
-  local path=$1 expected=$2
-  if [ ! -f "$path" ]; then fail_test "expected file missing: $path"; return; fi
-  assert_eq "$expected" "$(cat "$path")" "content of $path"
-}
-
-assert_file_absent() {
-  [ -e "$1" ] && fail_test "expected file to be absent: $1"
-  return 0
-}
-
-# ---------------------------------------------------------------- runner
-
-test_case() {
-  CURRENT_TEST=$1
-  if [ -n "${FILTER:-}" ]; then
-    case "$CURRENT_TEST" in *"$FILTER"*) ;; *) return 1;; esac
-  fi
-  FAIL_CURRENT=0
-  WORK="$TESTROOT/$CURRENT_TEST"
-  mkdir -p "$WORK/up" "$WORK/authors" "$WORK/lib"
-  echo "  - $CURRENT_TEST"
-  return 0
-}
-
-end_case() {
-  if [ "$FAIL_CURRENT" -eq 0 ]; then
-    PASS=$((PASS + 1))
-  else
-    FAIL=$((FAIL + 1))
-    FAILED_NAMES+=("$CURRENT_TEST")
-  fi
-}
 
 # ================================================================ TESTS
 
@@ -568,6 +399,7 @@ if test_case "defaults_root_to_script_location"; then
   new_upstream alpha
   clone_repo tools alpha
   cp "$PULL" "$WORK/lib/pull.sh"
+  cp "$SCRIPT_DIR/common.sh" "$WORK/lib/common.sh"   # pull.sh sources it
   upstream_add_file alpha NOTES.md "found without an argument"
 
   (cd / && bash "$WORK/lib/pull.sh" >"$WORK/stdout" 2>"$WORK/stderr"); echo $? >"$WORK/exit"
@@ -1052,14 +884,31 @@ if test_case "never_operates_on_the_current_directory"; then
   end_case
 fi
 
-# ================================================================ summary
+# ---------------------------------------------------------------------------
+if test_case "missing_common_sh_reports_a_clear_error"; then
+  new_upstream alpha
+  clone_repo tools alpha
+  mkdir -p "$WORK/solo"
+  cp "$PULL" "$WORK/solo/pull.sh"          # deliberately WITHOUT common.sh
 
-rm -rf "$TESTROOT"
+  "$WORK/solo/pull.sh" "$WORK/lib" >"$WORK/stdout" 2>"$WORK/stderr"
+  echo $? >"$WORK/exit"
 
-echo
-echo "passed: $PASS   failed: $FAIL"
-if [ "$FAIL" -gt 0 ]; then
-  printf 'failing: %s\n' "${FAILED_NAMES[*]}"
-  exit 1
+  assert_eq "2" "$(pull_exit)" "exit code"
+  assert_contains "$(cat "$WORK/stderr")" "common.sh" "error names the missing file"
+  end_case
 fi
-exit 0
+
+# ---------------------------------------------------------------------------
+if test_case "rejects_more_than_one_root_argument"; then
+  new_upstream alpha
+  clone_repo tools alpha
+
+  run_pull "$WORK/lib" "$WORK/lib"
+
+  assert_eq "2" "$(pull_exit)" "exit code"
+  assert_contains "$(cat "$WORK/stderr")" "one" "error explains only one root is accepted"
+  end_case
+fi
+
+finish_tests
