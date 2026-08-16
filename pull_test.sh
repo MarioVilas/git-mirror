@@ -95,6 +95,10 @@ pull_out() { cat "$WORK/stdout" "$WORK/stderr"; }
 pull_report() { cat "$WORK/stdout"; }
 pull_anomalies() { grep '^!' "$WORK/stdout" || true; }
 
+# Report lines with the given status prefix. Use this rather than a substring
+# search: the summary line carries the words "skipped" and "failed" as counts.
+pull_lines() { grep "^$1" "$WORK/stdout" || true; }
+
 # ---------------------------------------------------------------- assertions
 
 fail_test() {
@@ -599,7 +603,7 @@ if test_case "skipped_directory_is_not_counted_as_a_repo"; then
   run_pull "$WORK/lib"
 
   assert_contains "$(pull_report)" "1 repos" "repo count excludes the tarball"
-  assert_contains "$(pull_report)" "1 skipped" "skipped count"
+  assert_contains "$(pull_report)" "1 other directory skipped" "non-repo directories counted separately"
   end_case
 fi
 
@@ -637,7 +641,141 @@ if test_case "no_skipped_line_when_every_directory_is_a_repo"; then
 
   run_pull "$WORK/lib"
 
-  assert_not_contains "$(pull_report)" "skipped" "no skipped noise"
+  assert_eq "" "$(pull_lines skipped)" "no skipped lines"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "skips_repo_with_a_git_lock_file"; then
+  new_upstream alpha
+  clone_repo tools alpha
+  r=$(repo tools alpha)
+  before=$(git -C "$r" rev-parse origin/main)
+  touch "$r/.git/index.lock"
+  upstream_add_file alpha NOTES.md "must not arrive"
+
+  run_pull "$WORK/lib"
+
+  assert_eq "0" "$(pull_exit)" "exit code"
+  assert_eq "$before" "$(git -C "$r" rev-parse origin/main)" "locked repo left alone"
+  assert_file_absent "$r/NOTES.md"
+  assert_contains "$(pull_report)" "skipped" "skip reported"
+  assert_contains "$(pull_report)" "tools/alpha" "locked repo named"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "skips_repo_with_pack_transfer_in_progress"; then
+  new_upstream alpha
+  clone_repo tools alpha
+  r=$(repo tools alpha)
+  before=$(git -C "$r" rev-parse origin/main)
+  mkdir -p "$r/.git/objects/pack"
+  touch "$r/.git/objects/pack/tmp_pack_abc123"
+  upstream_add_file alpha NOTES.md "must not arrive"
+
+  run_pull "$WORK/lib"
+
+  assert_eq "0" "$(pull_exit)" "exit code"
+  assert_eq "$before" "$(git -C "$r" rev-parse origin/main)" "mid-clone repo left alone"
+  assert_contains "$(pull_report)" "tools/alpha" "mid-clone repo named"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "skips_repo_whose_head_does_not_resolve"; then
+  new_upstream alpha; new_upstream beta
+  clone_repo docs beta
+  # An interrupted clone: origin configured, objects not yet written.
+  mkdir -p "$WORK/lib/tools/half-cloned"
+  git init -q -b main "$WORK/lib/tools/half-cloned"
+  git -C "$WORK/lib/tools/half-cloned" remote add origin "$WORK/up/alpha.git"
+  upstream_add_file beta B.md "beta still updated"
+
+  run_pull "$WORK/lib"
+
+  assert_eq "0" "$(pull_exit)" "exit code"
+  assert_contains "$(pull_report)" "skipped  tools/half-cloned" "incomplete repo skipped, not failed"
+  assert_eq "" "$(pull_lines failed)" "no failure lines"
+  assert_file_content "$(repo docs beta)/B.md" "beta still updated"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "skipped_repo_is_not_counted_as_failure"; then
+  new_upstream alpha
+  clone_repo tools alpha
+  touch "$(repo tools alpha)/.git/index.lock"
+
+  run_pull "$WORK/lib"
+
+  assert_eq "0" "$(pull_exit)" "exit code"
+  assert_contains "$(pull_report)" "0 failed" "not counted as a failure"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "root_repository_is_never_touched"; then
+  new_upstream alpha
+  clone_repo tools alpha
+  # ROOT itself is a workspace repo holding the script.
+  git init -q -b main "$WORK/lib"
+  echo "the script" >"$WORK/lib/pull.sh"
+  git -C "$WORK/lib" add pull.sh
+  git -C "$WORK/lib" commit -qm "my own work"
+  root_head=$(git -C "$WORK/lib" rev-parse HEAD)
+  echo "uncommitted edit" >>"$WORK/lib/pull.sh"
+  upstream_add_file alpha NOTES.md "child updated"
+
+  run_pull "$WORK/lib"
+
+  assert_eq "$root_head" "$(git -C "$WORK/lib" rev-parse HEAD)" "root HEAD untouched"
+  assert_contains "$(cat "$WORK/lib/pull.sh")" "uncommitted edit" "root working tree untouched"
+  assert_file_content "$(repo tools alpha)/NOTES.md" "child updated"
+  assert_contains "$(pull_report)" "1 repos" "root not counted as a mirror"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "root_repository_does_not_appear_in_the_report"; then
+  new_upstream alpha
+  clone_repo tools alpha
+  git init -q -b main "$WORK/lib"
+
+  run_pull "$WORK/lib"
+
+  assert_not_contains "$(pull_report)" "$WORK" "absolute root path leaked into report"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "root_repository_is_excluded_given_a_trailing_slash"; then
+  new_upstream alpha
+  clone_repo tools alpha
+  git init -q -b main "$WORK/lib"
+  echo "the script" >"$WORK/lib/pull.sh"
+  git -C "$WORK/lib" add pull.sh
+  git -C "$WORK/lib" commit -qm "my own work"
+  root_head=$(git -C "$WORK/lib" rev-parse HEAD)
+
+  run_pull "$WORK/lib/"
+
+  assert_eq "$root_head" "$(git -C "$WORK/lib" rev-parse HEAD)" "root HEAD untouched"
+  assert_contains "$(pull_report)" "1 repos" "root not counted as a mirror"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "relative_root_path_is_accepted"; then
+  new_upstream alpha
+  clone_repo tools alpha
+  upstream_add_file alpha NOTES.md "reached via relative path"
+
+  (cd "$WORK" && "$PULL" lib >"$WORK/stdout" 2>"$WORK/stderr"); echo $? >"$WORK/exit"
+
+  assert_eq "0" "$(pull_exit)" "exit code"
+  assert_file_content "$(repo tools alpha)/NOTES.md" "reached via relative path"
+  assert_contains "$(pull_report)" "tools/alpha" "repo named by relative path"
   end_case
 fi
 

@@ -11,6 +11,9 @@
 # wrote to the library that should not have. Untracked files are left alone
 # unless one stands in the way of an update.
 #
+# ROOT itself is never treated as a mirror, so the script is safe to keep in a
+# git repository of its own.
+#
 set -uo pipefail
 
 JOBS=4
@@ -31,6 +34,12 @@ this script) to match its origin -- all branches, all tags, full history.
 Repositories are treated as read-only mirrors: local commits, uncommitted
 changes and local-only branches are discarded and reported as anomalies.
 Untracked files are preserved unless one blocks an update.
+
+ROOT itself is never updated, even if it is a git repository -- it may be the
+workspace holding this script. Repositories busy with another git process, and
+clones that have not finished, are skipped rather than half-updated.
+Directories alongside repositories that are not repositories are reported too,
+so nothing drops out of the sweep unnoticed.
 
   -j N   repositories to update in parallel (default: 4)
   -n     dry run: list the repositories, change nothing
@@ -63,12 +72,43 @@ parse_args() {
     echo "pull.sh: not a directory: $ROOT" >&2
     exit 2
   fi
+
+  # Canonicalise: find normalises the paths it prints, so a ROOT carrying a
+  # trailing slash (or a relative one) would no longer match them -- and the
+  # root repository would stop being excluded from the sweep.
+  ROOT=$(cd "$ROOT" && pwd) || exit 2
 }
 
 # Repository working directories below ROOT. Pruning at .git keeps find out of
 # repository internals, which on a repo the size of linux dominates the walk.
+# ROOT itself is excluded even when it is a repository: it may well be the
+# workspace holding this script, and a mirror update would reset away real
+# work. Only repositories *below* ROOT are mirrors.
 discover_repos() {
-  find "$ROOT" -type d -name .git -prune -printf '%h\n' 2>/dev/null | sort
+  find "$ROOT" -type d -name .git -prune -printf '%h\n' 2>/dev/null |
+    grep -vxF -- "$ROOT" | sort
+}
+
+# Reasons to leave a repository untouched this run. Checked before any fetch,
+# because a half-applied update is worse than none: an index.lock does not stop
+# a fetch, so without this guard a busy repo gets its refs moved and then fails
+# on the reset. All checks are read-only and take no locks.
+repo_skip_reason() {
+  local repo=$1
+
+  if compgen -G "$repo/.git/*.lock" >/dev/null 2>&1; then
+    echo "another git process is running here"
+    return 0
+  fi
+  if compgen -G "$repo/.git/objects/pack/tmp_pack_*" >/dev/null 2>&1; then
+    echo "a fetch or clone is in progress"
+    return 0
+  fi
+  if ! git -C "$repo" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+    echo "incomplete: HEAD does not resolve to a commit"
+    return 0
+  fi
+  return 1
 }
 
 # Directories sitting alongside repositories that are not themselves
@@ -191,6 +231,13 @@ update_repo() {
 process_repo() {
   local repo=$1 rel=$2 out=$3
 
+  local reason
+  if reason=$(repo_skip_reason "$repo"); then
+    echo "skipped  $rel  ($reason)" >"$out.out"
+    echo skipped >"$out.status"
+    return
+  fi
+
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "would    $rel" >"$out.out"
     echo dry >"$out.status"
@@ -227,8 +274,8 @@ main() {
     return 1
   fi
 
-  local skipped=()
-  mapfile -t skipped < <(discover_skipped "${repos[@]}")
+  local nonrepos=()
+  mapfile -t nonrepos < <(discover_skipped "${repos[@]}")
 
   OUTDIR=$(mktemp -d) || return 1
   trap 'rm -rf "${OUTDIR:-}"' EXIT
@@ -243,7 +290,7 @@ main() {
   wait
 
   # Emit in discovery order so the report is stable regardless of -j.
-  local updated=0 current=0 failed=0 dry=0
+  local updated=0 current=0 failed=0 dry=0 skipped=0
   for i in "${!repos[@]}"; do
     cat "$OUTDIR/$i.out"
     if [ -s "$OUTDIR/$i.err" ] && [ "$(cat "$OUTDIR/$i.status")" = failed ]; then
@@ -253,6 +300,7 @@ main() {
       updated) updated=$((updated + 1)) ;;
       current) current=$((current + 1)) ;;
       failed)  failed=$((failed + 1)) ;;
+      skipped) skipped=$((skipped + 1)) ;;
       dry)     dry=$((dry + 1)) ;;
     esac
   done
@@ -260,19 +308,20 @@ main() {
   # Always reported, even under -q: a directory that stopped being a repository
   # is exactly the kind of thing worth noticing.
   local s
-  for s in "${skipped[@]}"; do
+  for s in "${nonrepos[@]}"; do
     echo "skipped  ${s#"$ROOT"/}  (not a git repository)"
   done
 
-  local tail=""
-  [ ${#skipped[@]} -gt 0 ] && tail="; ${#skipped[@]} skipped"
+  local tail="" noun="directories"
+  [ ${#nonrepos[@]} -eq 1 ] && noun="directory"
+  [ ${#nonrepos[@]} -gt 0 ] && tail="; ${#nonrepos[@]} other $noun skipped"
 
   if [ "$DRY_RUN" -eq 1 ]; then
     echo "$total repos: dry run, nothing changed$tail"
     return 0
   fi
 
-  echo "$total repos: $updated updated, $current up to date, $failed failed$tail"
+  echo "$total repos: $updated updated, $current up to date, $skipped skipped, $failed failed$tail"
   [ "$failed" -eq 0 ]
 }
 
