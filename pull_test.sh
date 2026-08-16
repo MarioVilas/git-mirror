@@ -84,6 +84,41 @@ clone_repo() {
   git clone -q "$WORK/up/$name.git" "$WORK/lib/$cat/$name"
 }
 
+# A file:// URL -- required for --depth, which is ignored for local path clones.
+up_url() { echo "file://$WORK/up/$1.git"; }
+
+# Alternative clone shapes the script must detect and preserve.
+clone_repo_shallow() {
+  local cat=$1 name=$2
+  mkdir -p "$WORK/lib/$cat"
+  git clone -q --depth 1 "$(up_url "$name")" "$WORK/lib/$cat/$name"
+}
+
+clone_repo_single_branch() {
+  local cat=$1 name=$2
+  mkdir -p "$WORK/lib/$cat"
+  git clone -q --single-branch "$(up_url "$name")" "$WORK/lib/$cat/$name"
+}
+
+clone_repo_partial() {
+  local cat=$1 name=$2
+  mkdir -p "$WORK/lib/$cat"
+  git -C "$WORK/up/$name.git" config uploadpack.allowFilter true
+  git clone -q --filter=blob:none "$(up_url "$name")" "$WORK/lib/$cat/$name"
+}
+
+clone_repo_bare() {
+  local cat=$1 name=$2 dir=${3:-$2.git}
+  mkdir -p "$WORK/lib/$cat"
+  git clone -q --bare "$(up_url "$name")" "$WORK/lib/$cat/$dir"
+}
+
+clone_repo_mirror() {
+  local cat=$1 name=$2 dir=${3:-$2.git}
+  mkdir -p "$WORK/lib/$cat"
+  git clone -q --mirror "$(up_url "$name")" "$WORK/lib/$cat/$dir"
+}
+
 repo() { echo "$WORK/lib/$1/$2"; }
 
 run_pull() { "$PULL" "$@" >"$WORK/stdout" 2>"$WORK/stderr"; echo $? >"$WORK/exit"; }
@@ -98,6 +133,10 @@ pull_anomalies() { grep '^!' "$WORK/stdout" || true; }
 # Report lines with the given status prefix. Use this rather than a substring
 # search: the summary line carries the words "skipped" and "failed" as counts.
 pull_lines() { grep "^$1" "$WORK/stdout" || true; }
+
+# The bracketed shape fields only. A clone can have several attributes at once
+# (--depth implies --single-branch), so match words, not the whole field.
+pull_shapes() { grep -o '\[[^]]*\]' "$WORK/stdout" | tr -d '[]' || true; }
 
 # ---------------------------------------------------------------- assertions
 
@@ -776,6 +815,240 @@ if test_case "relative_root_path_is_accepted"; then
   assert_eq "0" "$(pull_exit)" "exit code"
   assert_file_content "$(repo tools alpha)/NOTES.md" "reached via relative path"
   assert_contains "$(pull_report)" "tools/alpha" "repo named by relative path"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "reports_shape_of_a_full_clone"; then
+  new_upstream alpha
+  clone_repo tools alpha
+
+  run_pull "$WORK/lib"
+
+  assert_contains "$(pull_shapes)" "full" "full shape reported"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "reports_shape_of_a_shallow_clone"; then
+  new_upstream alpha
+  upstream_commit alpha
+  clone_repo_shallow tools alpha
+
+  run_pull "$WORK/lib"
+
+  assert_eq "0" "$(pull_exit)" "exit code"
+  assert_contains "$(pull_shapes)" "shallow" "shallow shape reported"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "shallow_clone_stays_shallow"; then
+  new_upstream alpha
+  upstream_commit alpha
+  clone_repo_shallow tools alpha
+  upstream_add_file alpha NOTES.md "new upstream content"
+
+  run_pull "$WORK/lib"
+
+  r=$(repo tools alpha)
+  assert_eq "true" "$(git -C "$r" rev-parse --is-shallow-repository)" "still shallow"
+  assert_file_content "$r/NOTES.md" "new upstream content"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "reports_shape_of_a_single_branch_clone"; then
+  new_upstream alpha
+  upstream_commit alpha feature-x
+  clone_repo_single_branch tools alpha
+
+  run_pull "$WORK/lib"
+
+  assert_contains "$(pull_shapes)" "single-branch" "single-branch shape reported"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "single_branch_clone_does_not_churn_across_runs"; then
+  new_upstream alpha
+  upstream_commit alpha feature-x
+  clone_repo_single_branch tools alpha
+
+  run_pull "$WORK/lib"          # first run
+  run_pull "$WORK/lib"          # second run must be quiet
+
+  assert_eq "" "$(pull_anomalies)" "no anomalies on a settled single-branch clone"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "single_branch_clone_keeps_its_branch_scope"; then
+  new_upstream alpha
+  upstream_commit alpha feature-x
+  clone_repo_single_branch tools alpha
+  r=$(repo tools alpha)
+  before_refspec=$(git -C "$r" config --get-all remote.origin.fetch)
+
+  run_pull "$WORK/lib"
+
+  assert_eq "$before_refspec" "$(git -C "$r" config --get-all remote.origin.fetch)" "refspec preserved"
+  assert_eq "" "$(git -C "$r" for-each-ref --format='%(refname:short)' refs/heads/feature-x)" \
+    "untracked branch not conjured into existence"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "reports_shape_of_a_partial_clone"; then
+  new_upstream alpha
+  clone_repo_partial tools alpha
+
+  run_pull "$WORK/lib"
+
+  assert_contains "$(pull_shapes)" "partial" "partial shape reported"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "partial_clone_stays_partial"; then
+  new_upstream alpha
+  clone_repo_partial tools alpha
+  upstream_add_file alpha NOTES.md "content"
+
+  run_pull "$WORK/lib"
+
+  r=$(repo tools alpha)
+  assert_eq "blob:none" "$(git -C "$r" config --get remote.origin.partialclonefilter)" "filter preserved"
+  assert_file_content "$r/NOTES.md" "content"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "full_clone_still_mirrors_every_branch"; then
+  new_upstream alpha
+  upstream_commit alpha feature-x
+  clone_repo tools alpha
+  upstream_commit alpha feature-x
+
+  run_pull "$WORK/lib"
+
+  expected=$(git -C "$WORK/authors/alpha" rev-parse feature-x)
+  assert_eq "$expected" "$(git -C "$(repo tools alpha)" rev-parse feature-x)" "feature-x mirrored locally"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "discovers_a_bare_repository"; then
+  new_upstream alpha
+  clone_repo_bare tools alpha
+
+  run_pull "$WORK/lib"
+
+  assert_eq "0" "$(pull_exit)" "exit code"
+  assert_contains "$(pull_report)" "1 repos" "bare repo counted as a repository"
+  assert_eq "" "$(pull_lines skipped)" "not misreported as a non-repository"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "reports_bare_shape"; then
+  new_upstream alpha
+  clone_repo_mirror tools alpha
+
+  run_pull "$WORK/lib"
+
+  assert_contains "$(pull_shapes)" "bare" "bare shape reported"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "bare_repository_receives_new_commits_and_tags"; then
+  new_upstream alpha
+  clone_repo_mirror tools alpha
+  upstream_commit alpha
+  upstream_tag alpha v7.7.7
+
+  run_pull "$WORK/lib"
+
+  b="$WORK/lib/tools/alpha.git"
+  assert_eq "0" "$(pull_exit)" "exit code"
+  assert_eq "$(git -C "$WORK/authors/alpha" rev-parse main)" "$(git -C "$b" rev-parse main)" "main advanced"
+  assert_eq "v7.7.7" "$(git -C "$b" tag -l v7.7.7)" "tag arrived"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "bare_repository_branches_are_not_deleted"; then
+  new_upstream alpha
+  upstream_commit alpha feature-x
+  clone_repo_mirror tools alpha
+  b="$WORK/lib/tools/alpha.git"
+  before=$(git -C "$b" for-each-ref --format='%(refname:short)' refs/heads | sort | tr '\n' ' ')
+
+  run_pull "$WORK/lib"
+
+  assert_eq "$before" "$(git -C "$b" for-each-ref --format='%(refname:short)' refs/heads | sort | tr '\n' ' ')" \
+    "branches preserved"
+  assert_eq "" "$(pull_anomalies)" "no working-tree anomalies invented for a bare repo"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "plain_bare_clone_is_updated_too"; then
+  new_upstream alpha
+  clone_repo_bare tools alpha
+  upstream_commit alpha
+
+  run_pull "$WORK/lib"
+
+  assert_eq "0" "$(pull_exit)" "exit code"
+  assert_eq "$(git -C "$WORK/authors/alpha" rev-parse main)" \
+    "$(git -C "$WORK/lib/tools/alpha.git" rev-parse main)" "bare clone advanced"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+if test_case "a_stray_HEAD_file_is_not_mistaken_for_a_repository"; then
+  new_upstream alpha
+  clone_repo tools alpha
+  r=$(repo tools alpha)
+  mkdir -p "$r/testdata/refs"           # a repo whose own contents look git-ish
+  echo "ref: refs/heads/main" >"$r/testdata/HEAD"
+  mkdir -p "$WORK/lib/tools/notarepo"
+  echo "ref: refs/heads/main" >"$WORK/lib/tools/notarepo/HEAD"
+
+  run_pull "$WORK/lib"
+
+  assert_eq "0" "$(pull_exit)" "exit code"
+  assert_contains "$(pull_report)" "1 repos" "only the real repository counted"
+  assert_not_contains "$(pull_lines would)" "testdata" "repo contents not treated as repos"
+  end_case
+fi
+
+# ---------------------------------------------------------------------------
+# Regression: discovery must never emit an empty path. `git -C ""` silently
+# means the current directory, so a phantom entry made pull.sh hard-reset
+# whatever repository the user happened to be standing in.
+if test_case "never_operates_on_the_current_directory"; then
+  new_upstream host
+  new_upstream alpha
+  clone_repo_bare tools alpha          # a library with NO worktree repos at all
+
+  # Stand-in for "wherever the user happened to run this from": a real repo,
+  # with an origin, holding work that must survive.
+  git clone -q "$WORK/up/host.git" "$WORK/cwd"
+  echo "precious" >"$WORK/cwd/work.txt"
+  git -C "$WORK/cwd" add -A
+  git -C "$WORK/cwd" commit -qm "local work that must not be destroyed"
+  head_before=$(git -C "$WORK/cwd" rev-parse HEAD)
+  echo "uncommitted edit" >>"$WORK/cwd/work.txt"
+
+  (cd "$WORK/cwd" && "$PULL" "$WORK/lib" >"$WORK/stdout" 2>"$WORK/stderr")
+  echo $? >"$WORK/exit"
+
+  assert_eq "$head_before" "$(git -C "$WORK/cwd" rev-parse HEAD)" "cwd repo HEAD untouched"
+  assert_contains "$(cat "$WORK/cwd/work.txt")" "uncommitted edit" "cwd working tree untouched"
+  assert_contains "$(pull_report)" "1 repos" "no phantom repository counted"
   end_case
 fi
 

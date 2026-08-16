@@ -14,6 +14,10 @@
 # ROOT itself is never treated as a mirror, so the script is safe to keep in a
 # git repository of its own.
 #
+# Clone shape (shallow, single-branch, partial, bare) is detected and
+# preserved. Submodules are not handled: a repository containing them will be
+# mirrored, but its submodule contents will not be.
+#
 set -uo pipefail
 
 JOBS=4
@@ -34,6 +38,12 @@ this script) to match its origin -- all branches, all tags, full history.
 Repositories are treated as read-only mirrors: local commits, uncommitted
 changes and local-only branches are discarded and reported as anomalies.
 Untracked files are preserved unless one blocks an update.
+
+The SHAPE of each clone is detected and preserved, never "corrected": a
+shallow, single-branch, partial or bare mirror is a deliberate choice and is
+kept that way. Shape is reported on every line so an unexpected one is
+visible. The rule is: respect how a repository was created, disregard what
+has since been written into it.
 
 ROOT itself is never updated, even if it is a git repository -- it may be the
 workspace holding this script. Repositories busy with another git process, and
@@ -79,14 +89,69 @@ parse_args() {
   ROOT=$(cd "$ROOT" && pwd) || exit 2
 }
 
-# Repository working directories below ROOT. Pruning at .git keeps find out of
+# Is this directory itself a repository root? `git rev-parse` walks upwards, so
+# asking it naively from any subdirectory of a repo answers yes. Identity is
+# the reliable test: for a bare repo the git dir IS the directory; for a
+# worktree the toplevel is. The latter also covers --separate-git-dir, whose
+# git dir lives elsewhere entirely.
+is_repo_root() {
+  local dir=$1 abs
+  abs=$(cd "$dir" 2>/dev/null && pwd) || return 1
+  if [ "$(git -C "$dir" rev-parse --is-bare-repository 2>/dev/null)" = true ]; then
+    [ "$(git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)" = "$abs" ]
+  else
+    [ "$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" = "$abs" ]
+  fi
+}
+
+# Repository directories below ROOT. Pruning at .git keeps find out of
 # repository internals, which on a repo the size of linux dominates the walk.
 # ROOT itself is excluded even when it is a repository: it may well be the
 # workspace holding this script, and a mirror update would reset away real
 # work. Only repositories *below* ROOT are mirrors.
+#
+# Worktree repos are found by their .git directory. Bare repos have none, so
+# they are found by their HEAD file and then verified -- a repository's own
+# contents can include a file called HEAD (git's test suite does), and only the
+# identity check tells the two apart.
 discover_repos() {
-  find "$ROOT" -type d -name .git -prune -printf '%h\n' 2>/dev/null |
-    grep -vxF -- "$ROOT" | sort
+  local worktrees=() prune=() candidates=() r
+
+  mapfile -t worktrees < <(
+    find "$ROOT" -type d -name .git -prune -printf '%h\n' 2>/dev/null | sort -u
+  )
+
+  # Finding bare repos means examining files rather than just directories --
+  # ruinous across a worktree the size of firefox. So prune the repositories
+  # already found: nearly every file in the tree lives inside one, and none of
+  # them can contain a bare repo we care about.
+  for r in "${worktrees[@]}"; do
+    [ -n "$r" ] || continue
+    prune+=(-path "$r" -o)
+  done
+
+  if [ ${#prune[@]} -gt 0 ]; then
+    unset 'prune[-1]'   # drop the trailing -o
+    mapfile -t candidates < <(
+      find "$ROOT" \( "${prune[@]}" \) -prune -o -type f -name HEAD -printf '%h\n' 2>/dev/null | sort -u
+    )
+  else
+    mapfile -t candidates < <(
+      find "$ROOT" -type f -name HEAD -printf '%h\n' 2>/dev/null | sort -u
+    )
+  fi
+
+  {
+    # Guarded: printf on an empty array still emits one blank line, which would
+    # become a repository whose path is "" -- and `git -C ""` silently means
+    # the current directory, so such a phantom would operate on whatever
+    # repository the user happens to be standing in.
+    [ ${#worktrees[@]} -gt 0 ] && printf '%s\n' "${worktrees[@]}"
+    for r in "${candidates[@]}"; do
+      [ -n "$r" ] || continue
+      is_repo_root "$r" && echo "$r"
+    done
+  } | grep -vxF -- "$ROOT" | sort -u
 }
 
 # Reasons to leave a repository untouched this run. Checked before any fetch,
@@ -94,13 +159,17 @@ discover_repos() {
 # a fetch, so without this guard a busy repo gets its refs moved and then fails
 # on the reset. All checks are read-only and take no locks.
 repo_skip_reason() {
-  local repo=$1
+  local repo=$1 gitdir
 
-  if compgen -G "$repo/.git/*.lock" >/dev/null 2>&1; then
+  # Ask git where its metadata lives: a bare repo has no .git subdirectory, and
+  # --separate-git-dir puts it somewhere else entirely.
+  gitdir=$(git -C "$repo" rev-parse --absolute-git-dir 2>/dev/null) || gitdir="$repo/.git"
+
+  if compgen -G "$gitdir/*.lock" >/dev/null 2>&1; then
     echo "another git process is running here"
     return 0
   fi
-  if compgen -G "$repo/.git/objects/pack/tmp_pack_*" >/dev/null 2>&1; then
+  if compgen -G "$gitdir/objects/pack/tmp_pack_*" >/dev/null 2>&1; then
     echo "a fetch or clone is in progress"
     return 0
   fi
@@ -142,6 +211,55 @@ discover_skipped() {
   done | sort
 }
 
+# The shape of a clone: how its owner chose to create it. Reported on every
+# run and preserved, never "corrected" -- a shallow or single-branch mirror is
+# a legitimate choice. Content drift (local commits, dirty trees, stray
+# branches) is a separate matter and is always discarded.
+repo_shape() {
+  local repo=$1 attrs=()
+
+  if [ "$(git -C "$repo" rev-parse --is-bare-repository 2>/dev/null)" = true ]; then
+    echo bare
+    return
+  fi
+
+  [ "$(git -C "$repo" rev-parse --is-shallow-repository 2>/dev/null)" = true ] && attrs+=(shallow)
+  [ -n "$(git -C "$repo" config --get remote.origin.promisor 2>/dev/null)" ] && attrs+=(partial)
+
+  local fetchspec
+  fetchspec=$(git -C "$repo" config --get-all remote.origin.fetch 2>/dev/null)
+  case "$fetchspec" in
+    '')               attrs+=(no-remote) ;;
+    *'refs/heads/*'*) ;;
+    *)                attrs+=(single-branch) ;;
+  esac
+
+  if [ ${#attrs[@]} -eq 0 ]; then
+    echo full
+  else
+    echo "${attrs[*]}"
+  fi
+}
+
+# The refspecs that mirror local branches, derived from what this clone is
+# configured to track rather than hardcoded. A full clone yields the wildcard;
+# a single-branch clone yields just its one branch, so no branch outside the
+# clone's chosen scope is ever conjured into existence.
+mirror_refspecs() {
+  local repo=$1 spec src dst
+  while IFS= read -r spec; do
+    [ -n "$spec" ] || continue
+    spec=${spec#+}
+    src=${spec%%:*}
+    dst=${spec#*:}
+    case $dst in
+      refs/remotes/origin/*) ;;
+      *) continue ;;
+    esac
+    echo "+$src:refs/heads/${dst#refs/remotes/origin/}"
+  done < <(git -C "$repo" config --get-all remote.origin.fetch 2>/dev/null)
+}
+
 # Local branches with no counterpart on origin. Must be collected before the
 # pruning fetch, which erases the evidence for branches deleted upstream.
 local_only_branches() {
@@ -181,17 +299,22 @@ update_repo() {
   orphans=$(local_only_branches "$repo")
 
   # Every branch into refs/remotes/origin/*, every tag, and drop what upstream
-  # has deleted.
+  # has deleted. Uses the clone's configured refspec, so a narrow clone stays
+  # narrow.
   git -C "$repo" fetch --quiet --prune --prune-tags --tags origin >>"$log" 2>&1 || return 1
 
-  # Force local branches onto their upstream counterparts and prune those that
-  # no longer exist upstream. Git refuses to update the checked-out branch, so
-  # exclude it from this refspec -- the reset below covers it.
-  local current refspecs
+  # Force local branches onto their upstream counterparts, within the scope
+  # this clone tracks. Git refuses to update the checked-out branch, so exclude
+  # it here -- the reset below covers it.
+  local current specs=() args=()
   current=$(git -C "$repo" symbolic-ref --short -q HEAD)
-  refspecs=('+refs/heads/*:refs/heads/*')
-  [ -n "$current" ] && refspecs+=("^refs/heads/$current")
-  git -C "$repo" fetch --quiet --prune origin "${refspecs[@]}" >>"$log" 2>&1 || return 1
+  mapfile -t specs < <(mirror_refspecs "$repo")
+  if [ ${#specs[@]} -gt 0 ] &&
+     ! { [ ${#specs[@]} -eq 1 ] && [ "${specs[0]}" = "+refs/heads/$current:refs/heads/$current" ]; }; then
+    args=("${specs[@]}")
+    [ -n "$current" ] && args+=("^refs/heads/$current")
+    git -C "$repo" fetch --quiet --prune origin "${args[@]}" >>"$log" 2>&1 || return 1
+  fi
 
   # Which branch should this mirror sit on? The current one if it still exists
   # upstream, otherwise origin's default branch. This recovers a detached HEAD,
@@ -216,6 +339,16 @@ update_repo() {
     fi
   fi
 
+  # Remove branches with no upstream counterpart. A full clone's pruning fetch
+  # has already done this; a narrower clone's has not, and leaving them would
+  # re-report the same anomaly on every run.
+  local stray
+  while IFS= read -r stray; do
+    [ -n "$stray" ] || continue
+    [ "$stray" = "$target" ] && continue
+    git -C "$repo" branch -D "$stray" >>"$log" 2>&1
+  done < <(local_only_branches "$repo")
+
   # Discards local commits and uncommitted changes, and overwrites an untracked
   # file only where upstream has one at the same path.
   if ! git -C "$repo" reset --quiet --hard "origin/$target" >>"$log" 2>&1; then
@@ -225,11 +358,46 @@ update_repo() {
   fi
 }
 
+# A bare repository has no working tree, so fetching is the entire job: no
+# reset, no HEAD repair, and none of the working-tree anomaly checks, which
+# would otherwise mistake a mirror's refs/heads/* -- its whole point -- for
+# rogue local branches and delete them.
+update_bare_repo() {
+  local repo=$1 rel=$2 log=$3
+
+  if [ -n "$(git -C "$repo" config --get-all remote.origin.fetch 2>/dev/null)" ]; then
+    # --mirror records +refs/*:refs/*, which already declares its own scope.
+    git -C "$repo" fetch --quiet --prune --tags origin >>"$log" 2>&1 || return 1
+  else
+    # Plain --bare records no refspec at all, so an unqualified fetch would
+    # write FETCH_HEAD and leave every branch behind. Supply the refspec.
+    git -C "$repo" fetch --quiet --prune --prune-tags --tags origin \
+      '+refs/heads/*:refs/heads/*' >>"$log" 2>&1 || return 1
+  fi
+}
+
+update_any() {
+  local repo=$1 rel=$2 log=$3 shape=$4
+  if [ "$shape" = bare ]; then
+    update_bare_repo "$repo" "$rel" "$log"
+  else
+    update_repo "$repo" "$rel" "$log"
+  fi
+}
+
 # Update one repository, writing its report to <out>.out, any git output to
 # <out>.err and its outcome to <out>.status. Output is buffered per repository
 # so that parallel runs cannot interleave lines.
 process_repo() {
   local repo=$1 rel=$2 out=$3
+
+  # Never let an empty or bogus path through: `git -C ""` operates on the
+  # current directory, which is emphatically not a mirror.
+  if [ -z "$repo" ] || [ ! -d "$repo" ]; then
+    echo "failed   ${rel:-<empty path>}  (not a directory)" >"$out.out"
+    echo failed >"$out.status"
+    return
+  fi
 
   local reason
   if reason=$(repo_skip_reason "$repo"); then
@@ -238,8 +406,11 @@ process_repo() {
     return
   fi
 
+  local shape
+  shape=$(repo_shape "$repo")
+
   if [ "$DRY_RUN" -eq 1 ]; then
-    echo "would    $rel" >"$out.out"
+    echo "would    $rel  [$shape]" >"$out.out"
     echo dry >"$out.status"
     return
   fi
@@ -247,17 +418,17 @@ process_repo() {
   local before after
   before=$(git -C "$repo" rev-parse --short HEAD 2>/dev/null)
 
-  if update_repo "$repo" "$rel" "$out.err" >"$out.out"; then
+  if update_any "$repo" "$rel" "$out.err" "$shape" >"$out.out"; then
     after=$(git -C "$repo" rev-parse --short HEAD 2>/dev/null)
     if [ "$before" = "$after" ]; then
-      [ "$QUIET" -eq 1 ] || echo "ok       $rel" >>"$out.out"
+      [ "$QUIET" -eq 1 ] || echo "ok       $rel  [$shape]" >>"$out.out"
       echo current >"$out.status"
     else
-      echo "updated  $rel  $before..$after" >>"$out.out"
+      echo "updated  $rel  [$shape]  $before..$after" >>"$out.out"
       echo updated >"$out.status"
     fi
   else
-    echo "failed   $rel" >>"$out.out"
+    echo "failed   $rel  [$shape]" >>"$out.out"
     echo failed >"$out.status"
   fi
 }
@@ -265,8 +436,11 @@ process_repo() {
 main() {
   parse_args "$@"
 
-  local repos=()
-  mapfile -t repos < <(discover_repos)
+  local repos=() discovered=() r
+  mapfile -t discovered < <(discover_repos)
+  for r in "${discovered[@]}"; do
+    [ -n "$r" ] && repos+=("$r")
+  done
   local total=${#repos[@]}
 
   if [ "$total" -eq 0 ]; then
