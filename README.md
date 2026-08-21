@@ -236,6 +236,14 @@ awk -F'\t' 'BEGIN{print "["} !/^#/{printf "%s  {\"path\":\"%s\",\"url\":\"%s\",\
 - There is no import command yet: `export.sh` records what you have, but
   recreating a library elsewhere from a manifest is still manual. You create
   the repositories yourself with `git clone`.
+- **The manifest records repositories, not the library.** A TSV is one row per
+  repository, so there is nowhere to put anything that is not a per-repository
+  field: the directory structure you chose, and any notes you keep about what
+  the repositories are and why you cloned them. Restoring from `mirrors.tsv`
+  gets the code back and loses the filing system. *TODO: an export mode that
+  writes an archive — the manifest plus each directory's `README.md`, paths
+  intact — so a library can be moved or backed up whole. Deliberately not the
+  default: the flat TSV is the thing you commit and diff.*
 
 ## Welp, I shot myself in the foot
 
