@@ -320,9 +320,9 @@ inside a mirror; keep them somewhere the script does not manage.
 ## Tests
 
 ```sh
-./pull_test.sh                   # pull.sh
-./export_test.sh                 # export.sh
-FILTER=shallow ./pull_test.sh    # only tests whose name contains "shallow"
+./test_pull.sh                   # pull.sh
+./test_export.sh                 # export.sh
+FILTER=shallow ./test_pull.sh    # only tests whose name contains "shallow"
 ```
 
 Both suites build throwaway fixtures — bare "upstream" repositories plus clones
