@@ -379,16 +379,28 @@ main() {
   # Output is held back until every job finishes, so that parallel runs cannot
   # interleave. On a large library that is a long silence; say what is starting.
   # Terminal only, so redirected output stays clean.
-  [ -t 2 ] && printf 'pull.sh: updating %d repositories, %d at a time, logs at: %s\n' "$total" "$JOBS" "$OUTDIR" >&2
+  local progress=0
+  [ -t 2 ] && progress=1
+  [ "$progress" -eq 1 ] && printf 'pull.sh: updating %d repositories, %d at a time, logs at: %s\n' "$total" "$JOBS" "$OUTDIR" >&2
 
+  # While jobs run, keep one status line on the terminal, rewritten as each
+  # repository finishes. Completions are counted by marker file, since the jobs
+  # are separate processes and cannot share a counter.
   local i rel
   for i in "${!repos[@]}"; do
     while [ "$(jobs -rp | wc -l)" -ge "$JOBS" ]; do wait -n; done
     rel=${repos[$i]#"$ROOT"/}
     : >"$OUTDIR/$i.out"; : >"$OUTDIR/$i.err"; : >"$OUTDIR/$i.status"
-    process_repo "${repos[$i]}" "$rel" "$OUTDIR/$i" &
+    (
+      process_repo "${repos[$i]}" "$rel" "$OUTDIR/$i"
+      if [ "$progress" -eq 1 ]; then
+        : >"$OUTDIR/$i.done"
+        printf '\r\033[K[%d/%d] %s' "$(compgen -G "$OUTDIR/*.done" | wc -l)" "$total" "$rel" >&2
+      fi
+    ) &
   done
   wait
+  [ "$progress" -eq 1 ] && printf '\r\033[K' >&2
 
   # Emit in discovery order so the report is stable regardless of -j.
   local updated=0 current=0 failed=0 dry=0 skipped=0
